@@ -122,3 +122,43 @@ def test_unknown_account_fails_fast(settings, monkeypatch):
 @pytest.mark.parametrize("attempts, expected", [(1, 5.0), (2, 10.0), (3, 20.0), (20, 600.0)])
 def test_backoff_grows_and_caps(attempts, expected):
     assert backoff(attempts) == expected
+
+
+def test_outbox_is_fifo_per_conversation(settings):
+    db = settings.database_path
+    storage.intake(db, "17841400000000001", "u1", "m1", "Salam")
+    storage.intake(db, "17841400000000001", "u1", "m2", "Elvin")
+
+    sender = RecordingSender(failures=1)
+    worker = make_worker(sender)
+
+    asyncio.run(worker.run_once(settings))
+    assert sender.sent == []  # greeting failed, so the follow-up must wait
+
+    force_due(db)
+    asyncio.run(worker.run_once(settings))
+    assert sender.sent == [logic.GREETING]
+
+    force_due(db)
+    asyncio.run(worker.run_once(settings))
+    assert sender.sent == [logic.GREETING, logic.ASK_PHONE]
+
+
+def test_stuck_conversation_does_not_block_others(settings):
+    db = settings.database_path
+
+    class SelectiveSender:
+        def __init__(self) -> None:
+            self.sent: list[tuple[str, str]] = []
+
+        async def send(self, account, sender_id, text):
+            if sender_id == "blocked":
+                raise SendError("503 up")
+            self.sent.append((sender_id, text))
+
+    storage.intake(db, "17841400000000001", "blocked", "m-blocked", "Salam")
+    storage.intake(db, "17841400000000001", "healthy", "m-healthy", "Salam")
+
+    sender = SelectiveSender()
+    assert asyncio.run(make_worker(sender).run_once(settings)) == 2
+    assert [who for who, _ in sender.sent] == ["healthy"]

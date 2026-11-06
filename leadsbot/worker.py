@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Callable
+from typing import Any, Callable
 
 from . import storage
 from .config import Settings, load_settings
+from .notify import TelegramNotifier
 from .sender import InstagramSender, PermanentSendError, SendError
 
 logger = logging.getLogger("leadsbot.worker")
@@ -23,10 +24,12 @@ def backoff(attempts: int) -> float:
 class OutboxWorker:
     def __init__(
         self,
-        sender_factory: Callable[[Settings], InstagramSender] = InstagramSender,
+        sender_factory: Callable[[Settings], Any] = InstagramSender,
+        telegram_factory: Callable[[Settings], Any] | None = None,
         batch_size: int = 20,
     ) -> None:
         self.sender_factory = sender_factory
+        self.telegram_factory = telegram_factory or TelegramNotifier
         self.batch_size = batch_size
 
     async def run_once(self, settings: Settings | None = None) -> int:
@@ -36,9 +39,11 @@ class OutboxWorker:
         if not rows:
             return 0
         sender = self.sender_factory(settings)
+        notifier = self.telegram_factory(settings)
         for row in rows:
             account = settings.accounts.get(row["account_id"])
-            if account is None:
+            is_telegram = row["channel"] == "telegram"
+            if account is None and not is_telegram:
                 storage.mark_failed(
                     settings.database_path,
                     row["id"],
@@ -48,7 +53,10 @@ class OutboxWorker:
                 continue
             attempts = int(row["attempts"]) + 1
             try:
-                await sender.send(account, row["sender_id"], row["body"])
+                if is_telegram:
+                    await notifier.notify(row["account_id"], row["body"])
+                else:
+                    await sender.send(account, row["sender_id"], row["body"])
             except PermanentSendError as exc:
                 storage.mark_failed(settings.database_path, row["id"], str(exc), attempts)
                 logger.error("outbox %s failed permanently: %s", row["id"], exc)

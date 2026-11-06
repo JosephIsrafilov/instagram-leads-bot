@@ -66,6 +66,12 @@ class Settings:
     max_attempts: int
     max_hints: int
     request_timeout: float
+    telegram_token: str
+    telegram_chat_ids: tuple[str, ...]
+
+    @property
+    def notifications_enabled(self) -> bool:
+        return bool(self.telegram_token and self.telegram_chat_ids)
 
 
 def load_accounts() -> dict[str, Account]:
@@ -112,4 +118,10 @@ def load_settings() -> Settings:
         max_attempts=max(1, _int("OUTBOX_MAX_ATTEMPTS", 6)),
         max_hints=max(1, _int("BOT_MAX_HINTS", 3)),
         request_timeout=max(1.0, _float("META_REQUEST_TIMEOUT", 12.0)),
+        telegram_token=os.environ.get("LEADS_TELEGRAM_TOKEN", "").strip(),
+        telegram_chat_ids=tuple(
+            chat.strip()
+            for chat in os.environ.get("LEADS_TELEGRAM_CHAT_IDS", "").split(",")
+            if chat.strip()
+        ),
     )

@@ -129,6 +129,7 @@ async def incoming(request: Request) -> dict[str, Any]:
 
     accepted = 0
     skipped = 0
+    failed = 0
     for entry in data.get("entry", []):
         account_id = str(entry.get("id", ""))
         if account_id not in settings.accounts:
@@ -155,17 +156,21 @@ async def incoming(request: Request) -> dict[str, Any]:
                     str(message["mid"]),
                     text,
                     settings.max_hints,
+                    notify_telegram=settings.notifications_enabled,
                 )
             except Exception:
-                # Instagram should still get a 200; it retries unacknowledged
-                # deliveries, and the outbox holds whatever was committed.
-                logger.exception("failed to process message %s", message.get("mid"))
-                skipped += 1
+                # Never acknowledge what we did not store: returning 200 here would
+                # make Instagram drop the event and lose the lead. A 503 makes it
+                # retry, and dedupe protects everything already committed.
+                logger.exception("failed to persist message %s", message.get("mid"))
+                failed += 1
                 continue
             if plan is None:
                 skipped += 1  # duplicate delivery of an already handled message
             else:
                 accepted += 1
+    if failed:
+        raise HTTPException(status_code=503, detail="Storage unavailable, retry the delivery")
     return {"status": "accepted", "accepted": accepted, "skipped": skipped}
 
 

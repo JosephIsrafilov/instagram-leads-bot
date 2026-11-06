@@ -7,12 +7,13 @@ transaction as the conversation state it belongs to, so a crash between
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from .logic import STATUS_NEW, Plan, plan_reply
+from .logic import STATUS_AWAITING_CONTACT, STATUS_DONE, Plan, plan_reply
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS conversations (
@@ -22,7 +23,7 @@ CREATE TABLE IF NOT EXISTS conversations (
     updated_at TEXT NOT NULL,
     name TEXT,
     phone TEXT,
-    status TEXT NOT NULL DEFAULT 'new',
+    status TEXT NOT NULL DEFAULT 'awaiting_contact',
     hints INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (account_id, sender_id)
 );
@@ -37,6 +38,7 @@ CREATE TABLE IF NOT EXISTS outbox (
     account_id TEXT NOT NULL,
     sender_id TEXT NOT NULL,
     body TEXT NOT NULL,
+    channel TEXT NOT NULL DEFAULT 'instagram',
     created_at TEXT NOT NULL,
     attempts INTEGER NOT NULL DEFAULT 0,
     next_attempt_at TEXT NOT NULL,
@@ -60,7 +62,7 @@ MIGRATIONS = {
         "updated_at": "TEXT",
         "hints": "INTEGER NOT NULL DEFAULT 0",
     },
-    "outbox": {},
+    "outbox": {"channel": "TEXT NOT NULL DEFAULT 'instagram'"},
 }
 
 
@@ -98,6 +100,12 @@ def init_db(db_path: str) -> None:
                     con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
         # Old rows predate updated_at; backfill so ordering stays sane.
         con.execute("UPDATE conversations SET updated_at=started_at WHERE updated_at IS NULL")
+        # First prototype used 'new'/'collecting'; the dialogue is now an explicit
+        # state machine and those two both mean "we still know nothing".
+        con.execute(
+            "UPDATE conversations SET status='awaiting_contact'"
+            " WHERE status IN ('new','collecting')"
+        )
         con.executescript(INDEXES)
         con.commit()
     finally:
@@ -111,6 +119,7 @@ def intake(
     message_id: str,
     text: str,
     max_hints: int = 3,
+    notify_telegram: bool = False,
 ) -> Plan | None:
     """Record an incoming DM and enqueue the reply. None means "already handled"."""
     con = connect(db_path)
@@ -134,7 +143,7 @@ def intake(
             (account_id, sender_id),
         ).fetchone()
         if row is None:
-            plan = plan_reply(None, None, STATUS_NEW, 0, text, max_hints)
+            plan = plan_reply(None, None, STATUS_AWAITING_CONTACT, 0, text, max_hints)
             con.execute(
                 "INSERT INTO conversations"
                 " (account_id, sender_id, started_at, updated_at, name, phone, status, hints)"
@@ -150,6 +159,18 @@ def intake(
             )
         if plan.reply:
             enqueue(con, account_id, sender_id, plan.reply, stamp)
+        if notify_telegram and plan.status == STATUS_DONE and plan.phone:
+            enqueue(
+                con,
+                account_id,
+                sender_id,
+                json.dumps(
+                    {"name": plan.name, "phone": plan.phone, "instagram_id": sender_id},
+                    ensure_ascii=False,
+                ),
+                stamp,
+                channel="telegram",
+            )
         con.commit()
         return plan
     except Exception:
@@ -165,12 +186,13 @@ def enqueue(
     sender_id: str,
     body: str,
     created_at: str | None = None,
+    channel: str = "instagram",
 ) -> int:
     created_at = created_at or now()
     cursor = con.execute(
-        "INSERT INTO outbox (account_id, sender_id, body, created_at, next_attempt_at)"
-        " VALUES (?,?,?,?,?)",
-        (account_id, sender_id, body, created_at, created_at),
+        "INSERT INTO outbox (account_id, sender_id, body, channel, created_at, next_attempt_at)"
+        " VALUES (?,?,?,?,?,?)",
+        (account_id, sender_id, body, channel, created_at, created_at),
     )
     return int(cursor.lastrowid)
 
@@ -182,11 +204,17 @@ def claim_due(db_path: str, limit: int = 20, lease_seconds: int = 120) -> list[d
         con.execute("BEGIN IMMEDIATE")
         stamp = now()
         rows = con.execute(
-            "SELECT id, account_id, sender_id, body, attempts FROM outbox"
-            " WHERE sent_at IS NULL AND failed_at IS NULL"
-            "   AND next_attempt_at <= ?"
-            "   AND (locked_until IS NULL OR locked_until <= ?)"
-            " ORDER BY id LIMIT ?",
+            "SELECT id, account_id, sender_id, body, channel, attempts FROM outbox o"
+            " WHERE o.sent_at IS NULL AND o.failed_at IS NULL"
+            "   AND o.next_attempt_at <= ?"
+            "   AND (o.locked_until IS NULL OR o.locked_until <= ?)"
+            # FIFO per conversation: never send message N+1 while N is still queued,
+            # otherwise a retried greeting can land after the next reply.
+            "   AND o.id = (SELECT MIN(x.id) FROM outbox x"
+            "               WHERE x.account_id=o.account_id AND x.sender_id=o.sender_id"
+            "                 AND x.channel=o.channel"
+            "                 AND x.sent_at IS NULL AND x.failed_at IS NULL)"
+            " ORDER BY o.id LIMIT ?",
             (stamp, stamp, limit),
         ).fetchall()
         lease = later(lease_seconds)
@@ -238,17 +266,57 @@ def mark_failed(db_path: str, outbox_id: int, error: str, attempts: int = 0) -> 
         con.close()
 
 
-def leads(db_path: str, status: str | None = None, limit: int = 500) -> list[dict[str, Any]]:
+def leads(
+    db_path: str,
+    status: str | None = None,
+    account_id: str | None = None,
+    limit: int = 500,
+    offset: int = 0,
+) -> list[dict[str, Any]]:
     con = connect(db_path)
     try:
-        sql = "SELECT * FROM conversations"
-        params: list[Any] = []
-        if status:
-            sql += " WHERE status=?"
-            params.append(status)
-        sql += " ORDER BY updated_at DESC LIMIT ?"
-        params.append(limit)
+        where, params = _lead_filters(status, account_id)
+        sql = f"SELECT * FROM conversations{where} ORDER BY updated_at DESC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
         return [dict(row) for row in con.execute(sql, params)]
+    finally:
+        con.close()
+
+
+def count_leads(db_path: str, status: str | None = None, account_id: str | None = None) -> int:
+    con = connect(db_path)
+    try:
+        where, params = _lead_filters(status, account_id)
+        row = con.execute(f"SELECT COUNT(*) AS n FROM conversations{where}", params).fetchone()
+        return int(row["n"])
+    finally:
+        con.close()
+
+
+def _lead_filters(status: str | None, account_id: str | None) -> tuple[str, list[Any]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    if status:
+        clauses.append("status=?")
+        params.append(status)
+    if account_id:
+        clauses.append("account_id=?")
+        params.append(account_id)
+    return (" WHERE " + " AND ".join(clauses) if clauses else ""), params
+
+
+def set_status(db_path: str, account_id: str, sender_id: str, status: str) -> bool:
+    """Staff action: take over a dialogue (manual) or hand it back to the bot."""
+    con = connect(db_path)
+    try:
+        cursor = con.execute(
+            "UPDATE conversations SET status=?, updated_at=?,"
+            " hints=CASE WHEN ?='awaiting_contact' THEN 0 ELSE hints END"
+            " WHERE account_id=? AND sender_id=?",
+            (status, now(), status, account_id, sender_id),
+        )
+        con.commit()
+        return cursor.rowcount > 0
     finally:
         con.close()
 
@@ -260,7 +328,9 @@ def stats(db_path: str) -> dict[str, Any]:
             "SELECT"
             " (SELECT COUNT(*) FROM conversations) AS total,"
             " (SELECT COUNT(*) FROM conversations WHERE status='done') AS done,"
-            " (SELECT COUNT(*) FROM conversations WHERE status='collecting') AS collecting,"
+            " (SELECT COUNT(*) FROM conversations"
+            "   WHERE status IN ('awaiting_contact','awaiting_name','awaiting_phone')) AS waiting,"
+            " (SELECT COUNT(*) FROM conversations WHERE status='manual') AS manual,"
             " (SELECT COUNT(*) FROM outbox WHERE sent_at IS NULL AND failed_at IS NULL) AS pending,"
             " (SELECT COUNT(*) FROM outbox WHERE failed_at IS NOT NULL) AS failed"
         ).fetchone()

@@ -20,8 +20,15 @@ class PermanentSendError(SendError):
 
 
 class InstagramSender:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
         self.settings = settings
+        # Injectable transport keeps HTTP behaviour (200/400/429/timeout/...) testable
+        # without touching the network.
+        self.transport = transport
 
     async def send(self, account: Account, sender_id: str, text: str) -> None:
         if self.settings.send_mode == "console":
@@ -34,7 +41,9 @@ class InstagramSender:
         )
         payload = {"recipient": {"id": sender_id}, "message": {"text": text}}
         try:
-            async with httpx.AsyncClient(timeout=self.settings.request_timeout) as client:
+            async with httpx.AsyncClient(
+                timeout=self.settings.request_timeout, transport=self.transport
+            ) as client:
                 response = await client.post(
                     url,
                     json=payload,

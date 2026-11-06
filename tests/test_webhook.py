@@ -55,7 +55,7 @@ def test_two_accounts_are_independent_and_duplicates_ignored(client, settings):
     rows = {(row["account_id"], row["sender_id"]): row for row in storage.leads(db)}
     assert rows[(ACCOUNT_A, "personA")]["status"] == "done"
     assert rows[(ACCOUNT_A, "personA")]["phone"].endswith("4567")
-    assert rows[(ACCOUNT_B, "personA")]["status"] == "collecting"
+    assert rows[(ACCOUNT_B, "personA")]["status"] == "awaiting_contact"
     assert storage.stats(db)["pending"] == 3
 
 

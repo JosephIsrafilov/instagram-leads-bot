@@ -57,7 +57,7 @@ def test_csv_status_filter(client, settings):
     from leadsbot import storage
 
     storage.intake(settings.database_path, ACCOUNT_A, "user-2", "m-4", "Salam")
-    rows = client.get("/admin/leads.csv?status=collecting", auth=AUTH)
+    rows = client.get("/admin/leads.csv?status=awaiting_contact", auth=AUTH)
     text = rows.content.decode("utf-8-sig")
     assert "user-2" in text
     assert "user-1" not in text
