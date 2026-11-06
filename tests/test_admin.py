@@ -50,7 +50,7 @@ def test_csv_export(client, settings):
     assert rows[0]["name"] == "Elvin"
     assert rows[0]["phone"].endswith("4422")
     assert rows[0]["status"] == "done"
-    assert rows[0]["account_id"] == ACCOUNT_A
+    assert rows[0]["account"] == ACCOUNT_A
 
 
 def test_csv_status_filter(client, settings):
@@ -70,3 +70,67 @@ def test_health_reports_counts(client, settings):
     assert payload["total"] == 1
     assert payload["done"] == 1
     assert payload["pending"] == 2
+
+
+# --- username, search, lead detail -------------------------------------------
+def test_panel_shows_username_and_profile_link(client, settings):
+    from leadsbot import storage
+
+    storage.intake(
+        settings.database_path, ACCOUNT_A, "user-9", "m-9", "Elvin 0501234567", username="elvin_m"
+    )
+    page = client.get("/admin", auth=AUTH).text
+    assert "@elvin_m" in page
+    assert "https://instagram.com/elvin_m" in page
+
+
+def test_search_matches_username_name_and_phone(client, settings):
+    from leadsbot import storage
+
+    storage.intake(settings.database_path, ACCOUNT_A, "user-a", "m-a", "Elvin 0501234567", username="elvin_m")
+    storage.intake(settings.database_path, ACCOUNT_A, "user-b", "m-b", "Aysel 0553334422", username="aysel_g")
+
+    by_username = client.get("/admin?q=elvin_m", auth=AUTH).text
+    assert "Elvin" in by_username and "Aysel" not in by_username
+
+    by_phone = client.get("/admin?q=0553334422", auth=AUTH).text
+    assert "Aysel" in by_phone and "Elvin" not in by_phone
+
+    by_name = client.get("/admin?q=Aysel", auth=AUTH).text
+    assert "Aysel" in by_name and "Elvin" not in by_name
+
+
+def test_lead_detail_page(client, settings):
+    from leadsbot import storage
+
+    storage.intake(settings.database_path, ACCOUNT_A, "user-9", "m-9", "Elvin 0501234567", username="elvin_m")
+    response = client.get(f"/admin/lead/{ACCOUNT_A}/user-9", auth=AUTH)
+    assert response.status_code == 200
+    assert "tel:+994501234567" in response.text
+    assert "https://instagram.com/elvin_m" in response.text
+    assert "Söhbət" in response.text
+
+    assert client.get(f"/admin/lead/{ACCOUNT_A}/nobody", auth=AUTH).status_code == 404
+    assert client.get(f"/admin/lead/{ACCOUNT_A}/user-9").status_code == 401
+
+
+def test_csv_contains_username_and_instagram_id(client, settings):
+    from leadsbot import storage
+
+    storage.intake(settings.database_path, ACCOUNT_A, "user-9", "m-9", "Elvin 0501234567", username="elvin_m")
+    text = client.get("/admin/leads.csv", auth=AUTH).content.decode("utf-8-sig")
+    header = text.splitlines()[0]
+    assert "instagram_id" in header and "username" in header
+    assert "elvin_m" in text and "user-9" in text
+
+
+def test_timeline_shows_customer_and_bot_chronologically(client, settings):
+    from leadsbot import storage
+
+    storage.intake(settings.database_path, ACCOUNT_A, "user-t", "m-1", "Salam")
+    storage.intake(settings.database_path, ACCOUNT_A, "user-t", "m-2", "Elvin 0501234567")
+
+    page = client.get(f"/admin/lead/{ACCOUNT_A}/user-t", auth=AUTH).text
+    assert "Müştəri" in page          # inbound messages are visible to managers
+    assert "Elvin 0501234567" in page
+    assert page.index("Salam") < page.index("Elvin 0501234567")  # oldest first

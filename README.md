@@ -9,6 +9,9 @@ Deterministic: no LLM, no ManyChat, no paid AI service, no VPS needed for develo
 2. Collect both — in one message or separately. A first message that already contains
    a phone number is not greeted again; the bot asks only for the missing field.
 3. Save the lead in SQLite, keyed by Instagram account + customer sender ID.
+   The Instagram **username** (and profile name) is fetched once per conversation via
+   `GET /{igsid}?fields=username,name` and stored with the lead; if the lookup fails the
+   dialogue continues and the next message retries it.
 4. Send a thank-you message.
 5. Stay silent afterwards; staff take over from the panel. After `BOT_MAX_HINTS`
    unanswered prompts the bot stops asking (`manual`) instead of spamming.
@@ -84,13 +87,17 @@ CSV: `/admin/leads.csv?status=done&account=17841400000000001`.
 
 ## Admin panel
 
-- counters: total conversations, captured leads, in progress, in manual, queued, failed
-- filters by account and status, 50 rows per page with pagination
+- one dense queue: client (name + `@username` linking to the profile), phone as `tel:`
+  link, account, status pill, relative update time
+- search by name, phone (local `055…` format works), `@username` or Instagram ID
+- filters by account and status group, 50 rows per page
 - **Botu dayandır** — the bot stops answering that customer (`manual`) and any reply
   still queued for them is cancelled; **Bota qaytar** — hand the dialogue back and
   reset the prompts
-- failed outbox messages with the exact API error
-- CSV export (UTF-8 BOM, opens correctly in Excel), filterable by account/status
+- lead detail page: contact block, one-click actions, and the full conversation
+  (customer messages + bot replies, oldest first, with delivery state and timestamp)
+- failed outbox messages with the exact API error, cancelled ones counted separately
+- CSV export (UTF-8 BOM, opens correctly in Excel), filtered like the current view
 - disabled entirely (503) when `ADMIN_PASSWORD` is empty, HTTP Basic otherwise
 
 ## Telegram notifications (optional, recommended)
@@ -110,7 +117,7 @@ message in another. Without the variables nothing is queued.
 ## Tests
 
 ```bash
-pytest -q          # 95 tests
+pytest -q          # 104 tests
 python tools/loadtest.py --count 500
 ```
 

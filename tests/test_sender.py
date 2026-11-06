@@ -83,3 +83,40 @@ def test_console_mode_never_hits_http(api_settings, monkeypatch):
 
     sender = InstagramSender(settings, transport=httpx.MockTransport(handler))
     assert asyncio.run(sender.send(settings.accounts["123"], "user-1", "Salam")) is None
+
+
+# --- profile lookup (username) ------------------------------------------------
+def test_fetch_profile_returns_username(api_settings):
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/900001")
+        assert request.url.params["fields"] == "username,name"
+        assert request.headers["authorization"] == "Bearer tok"
+        return httpx.Response(200, json={"username": "@elvin_m", "name": "Elvin M"})
+
+    sender = InstagramSender(api_settings, transport=httpx.MockTransport(handler))
+    profile = asyncio.run(sender.fetch_profile(api_settings.accounts["123"], "900001"))
+    assert profile == {"username": "elvin_m", "name": "Elvin M"}
+
+
+def test_fetch_profile_failure_is_tolerated(api_settings):
+    sender = InstagramSender(
+        api_settings, transport=httpx.MockTransport(lambda _r: httpx.Response(400))
+    )
+    assert asyncio.run(sender.fetch_profile(api_settings.accounts["123"], "900001")) is None
+
+    def boom(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectTimeout("slow", request=request)
+
+    sender = InstagramSender(api_settings, transport=httpx.MockTransport(boom))
+    assert asyncio.run(sender.fetch_profile(api_settings.accounts["123"], "900001")) is None
+
+
+def test_fetch_profile_skipped_in_console_mode(api_settings, monkeypatch):
+    monkeypatch.setenv("IG_SEND_MODE", "console")
+    settings = load_settings()
+
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+        raise AssertionError("no network in console mode")
+
+    sender = InstagramSender(settings, transport=httpx.MockTransport(handler))
+    assert asyncio.run(sender.fetch_profile(settings.accounts["123"], "900001")) is None

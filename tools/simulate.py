@@ -41,7 +41,12 @@ def load_dotenv_simple() -> None:
         os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
 
-def send(url: str, secret: str, account: str, sender: str, mid: str, text: str) -> tuple[int, str]:
+def send(
+    url: str, secret: str, account: str, sender: str, mid: str, text: str, username: str | None = None
+) -> tuple[int, str]:
+    sender_block: dict[str, object] = {"id": sender}
+    if username:
+        sender_block["username"] = username.lstrip("@")
     payload = {
         "object": "instagram",
         "entry": [
@@ -50,7 +55,7 @@ def send(url: str, secret: str, account: str, sender: str, mid: str, text: str) 
                 "time": int(time.time()),
                 "messaging": [
                     {
-                        "sender": {"id": sender},
+                        "sender": sender_block,
                         "recipient": {"id": account},
                         "timestamp": int(time.time() * 1000),
                         "message": {"mid": mid, "text": text},
@@ -120,6 +125,11 @@ def main() -> int:
     parser.add_argument("--url", default=os.environ.get("SIM_URL", "http://127.0.0.1:8000"))
     parser.add_argument("--account", default=os.environ.get("SIM_ACCOUNT", DEFAULT_ACCOUNT))
     parser.add_argument("--sender", default=os.environ.get("SIM_SENDER", "900000001"))
+    parser.add_argument(
+        "--username",
+        default=os.environ.get("SIM_USERNAME"),
+        help="Instagram username to attach to the simulated sender",
+    )
     parser.add_argument("--secret", default=os.environ.get("META_APP_SECRET", DEFAULT_SECRET))
     parser.add_argument("--db", default=os.environ.get("DATABASE_PATH", DEFAULT_DB))
     parser.add_argument("--wait", type=float, default=3.0, help="seconds to wait for the worker")
@@ -133,7 +143,7 @@ def main() -> int:
     stamp = str(int(time.time()))
     for index, text in enumerate(texts, start=1):
         mid = f"sim-{args.sender}-{stamp}-{index}"
-        code, body = send(args.url, secret, args.account, args.sender, mid, text)
+        code, body = send(args.url, secret, args.account, args.sender, mid, text, args.username)
         print(f"\n> {text}\n  HTTP {code} {body}")
 
     if args.wait:

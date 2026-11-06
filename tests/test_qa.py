@@ -331,4 +331,4 @@ def test_stopping_the_bot_cancels_queued_replies(client, settings):
     assert counters["cancelled"] == 1 and counters["failed"] == 0
     assert storage.failed_messages(settings.database_path) == []
     panel = client.get("/admin", auth=AUTH).text
-    assert "Ləğv edilmiş" in panel
+    assert "ləğv" in panel

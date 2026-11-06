@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS conversations (
     updated_at TEXT NOT NULL,
     name TEXT,
     phone TEXT,
+    username TEXT,
     status TEXT NOT NULL DEFAULT 'awaiting_contact',
     hints INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (account_id, sender_id)
@@ -33,6 +34,15 @@ CREATE TABLE IF NOT EXISTS processed_messages (
     received_at TEXT NOT NULL,
     PRIMARY KEY (account_id, message_id)
 );
+CREATE TABLE IF NOT EXISTS inbox (
+    account_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    sender_id TEXT NOT NULL,
+    text TEXT NOT NULL,
+    received_at TEXT NOT NULL,
+    PRIMARY KEY (account_id, message_id)
+);
+CREATE INDEX IF NOT EXISTS inbox_conversation_idx ON inbox (account_id, sender_id, received_at);
 CREATE TABLE IF NOT EXISTS outbox (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     account_id TEXT NOT NULL,
@@ -61,6 +71,7 @@ MIGRATIONS = {
     "conversations": {
         "updated_at": "TEXT",
         "hints": "INTEGER NOT NULL DEFAULT 0",
+        "username": "TEXT",
     },
     "outbox": {"channel": "TEXT NOT NULL DEFAULT 'instagram'"},
 }
@@ -120,6 +131,7 @@ def intake(
     text: str,
     max_hints: int = 3,
     notify_chat_ids: tuple[str, ...] = (),
+    username: str | None = None,
 ) -> Plan | None:
     """Record an incoming DM and enqueue the reply. None means "already handled"."""
     con = connect(db_path)
@@ -137,6 +149,11 @@ def intake(
             "INSERT INTO processed_messages(account_id, message_id, received_at) VALUES (?,?,?)",
             (account_id, message_id, stamp),
         )
+        con.execute(
+            "INSERT OR IGNORE INTO inbox(account_id, message_id, sender_id, text, received_at)"
+            " VALUES (?,?,?,?,?)",
+            (account_id, message_id, sender_id, text, stamp),
+        )
         row = con.execute(
             "SELECT name, phone, status, hints FROM conversations"
             " WHERE account_id=? AND sender_id=?",
@@ -147,16 +164,23 @@ def intake(
             plan = plan_reply(None, None, STATUS_AWAITING_CONTACT, 0, text, max_hints)
             con.execute(
                 "INSERT INTO conversations"
-                " (account_id, sender_id, started_at, updated_at, name, phone, status, hints)"
-                " VALUES (?,?,?,?,?,?,?,?)",
-                (account_id, sender_id, stamp, stamp, plan.name, plan.phone, plan.status, plan.hints),
+                " (account_id, sender_id, started_at, updated_at, name, phone, username, status, hints)"
+                " VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    account_id, sender_id, stamp, stamp,
+                    plan.name, plan.phone, username, plan.status, plan.hints,
+                ),
             )
         else:
             plan = plan_reply(row["name"], row["phone"], row["status"], row["hints"], text, max_hints)
             con.execute(
-                "UPDATE conversations SET name=?, phone=?, status=?, hints=?, updated_at=?"
+                "UPDATE conversations SET name=?, phone=?, username=COALESCE(?, username),"
+                " status=?, hints=?, updated_at=?"
                 " WHERE account_id=? AND sender_id=?",
-                (plan.name, plan.phone, plan.status, plan.hints, stamp, account_id, sender_id),
+                (
+                    plan.name, plan.phone, username,
+                    plan.status, plan.hints, stamp, account_id, sender_id,
+                ),
             )
         if plan.reply:
             enqueue(con, account_id, sender_id, plan.reply, stamp)
@@ -302,10 +326,11 @@ def leads(
     account_id: str | None = None,
     limit: int = 500,
     offset: int = 0,
+    q: str | None = None,
 ) -> list[dict[str, Any]]:
     con = connect(db_path)
     try:
-        where, params = _lead_filters(status, account_id)
+        where, params = _lead_filters(status, account_id, q)
         sql = f"SELECT * FROM conversations{where} ORDER BY updated_at DESC LIMIT ? OFFSET ?"
         params.extend([limit, offset])
         return [dict(row) for row in con.execute(sql, params)]
@@ -313,25 +338,98 @@ def leads(
         con.close()
 
 
-def count_leads(db_path: str, status: str | None = None, account_id: str | None = None) -> int:
+def count_leads(
+    db_path: str,
+    status: str | None = None,
+    account_id: str | None = None,
+    q: str | None = None,
+) -> int:
     con = connect(db_path)
     try:
-        where, params = _lead_filters(status, account_id)
+        where, params = _lead_filters(status, account_id, q)
         row = con.execute(f"SELECT COUNT(*) AS n FROM conversations{where}", params).fetchone()
         return int(row["n"])
     finally:
         con.close()
 
 
-def _lead_filters(status: str | None, account_id: str | None) -> tuple[str, list[Any]]:
+def get_lead(db_path: str, account_id: str, sender_id: str) -> dict[str, Any] | None:
+    con = connect(db_path)
+    try:
+        row = con.execute(
+            "SELECT * FROM conversations WHERE account_id=? AND sender_id=?",
+            (account_id, sender_id),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        con.close()
+
+
+def lead_timeline(
+    db_path: str, account_id: str, sender_id: str, limit: int = 200
+) -> list[dict[str, Any]]:
+    """Customer messages and bot replies merged chronologically."""
+    con = connect(db_path)
+    try:
+        rows = con.execute(
+            "SELECT direction, body, at, channel, state FROM ("
+            "  SELECT 'in' AS direction, text AS body, received_at AS at, '' AS channel,"
+            "         '' AS state FROM inbox WHERE account_id=? AND sender_id=?"
+            "  UNION ALL"
+            "  SELECT 'out', body, created_at, channel,"
+            "         CASE WHEN sent_at IS NOT NULL THEN 'sent'"
+            "              WHEN failed_at IS NOT NULL THEN"
+            "                   CASE WHEN COALESCE(last_error,'') LIKE 'cancelled%'"
+            "                        THEN 'cancelled' ELSE 'failed' END"
+            "              ELSE 'queued' END"
+            "  FROM outbox WHERE account_id=? AND sender_id=?"
+            ") ORDER BY at ASC LIMIT ?",
+            (account_id, sender_id, account_id, sender_id, limit),
+        )
+        return [dict(row) for row in rows]
+    finally:
+        con.close()
+
+
+def set_username(db_path: str, account_id: str, sender_id: str, username: str | None) -> None:
+    if not username:
+        return
+    con = connect(db_path)
+    try:
+        con.execute(
+            "UPDATE conversations SET username=? WHERE account_id=? AND sender_id=?",
+            (username.lstrip("@"), account_id, sender_id),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def _lead_filters(
+    status: str | None, account_id: str | None, q: str | None = None
+) -> tuple[str, list[Any]]:
     clauses: list[str] = []
     params: list[Any] = []
     if status:
-        clauses.append("status=?")
-        params.append(status)
+        if status == "waiting":
+            clauses.append("status IN ('awaiting_contact','awaiting_name','awaiting_phone')")
+        else:
+            clauses.append("status=?")
+            params.append(status)
     if account_id:
         clauses.append("account_id=?")
         params.append(account_id)
+    if q:
+        digits = "".join(ch for ch in q if ch.isdigit())
+        if digits.startswith("0"):
+            # Local format 055… must match the stored +99455…
+            digits = digits[1:]
+        clauses.append(
+            "(name LIKE ? OR username LIKE ? OR sender_id LIKE ?"
+            " OR REPLACE(REPLACE(COALESCE(phone,''),'+',''),' ','') LIKE ?)"
+        )
+        needle = f"%{q.lstrip('@')}%"
+        params.extend([needle, needle, needle, f"%{digits}%" if digits else needle])
     return (" WHERE " + " AND ".join(clauses) if clauses else ""), params
 
 

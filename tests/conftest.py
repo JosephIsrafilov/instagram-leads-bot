@@ -58,7 +58,12 @@ def signed_raw(payload: dict) -> tuple[bytes, dict[str, str]]:
     return raw, {"x-hub-signature-256": signature, "content-type": "application/json"}
 
 
-def signed_payload(account: str, sender: str, mid: str, text: str) -> tuple[bytes, dict[str, str]]:
+def signed_payload(
+    account: str, sender: str, mid: str, text: str, username: str | None = None
+) -> tuple[bytes, dict[str, str]]:
+    sender_block: dict[str, object] = {"id": sender}
+    if username:
+        sender_block["username"] = username.lstrip("@")
     return signed_raw(
         {
             "object": "instagram",
@@ -68,7 +73,7 @@ def signed_payload(account: str, sender: str, mid: str, text: str) -> tuple[byte
                     "time": 1700000000,
                     "messaging": [
                         {
-                            "sender": {"id": sender},
+                            "sender": sender_block,
                             "recipient": {"id": account},
                             "timestamp": 1700000000000,
                             "message": {"mid": mid, "text": text},

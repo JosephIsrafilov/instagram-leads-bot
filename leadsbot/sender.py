@@ -58,3 +58,36 @@ class InstagramSender:
         if response.status_code == 429 or response.status_code >= 500:
             raise SendError(detail)
         raise PermanentSendError(detail)
+
+    async def fetch_profile(self, account: Account, igsid: str) -> dict[str, str] | None:
+        """Instagram profile behind an IGSID (username + display name).
+
+        Best effort: any failure returns None and the dialogue continues. In console
+        mode there is no API to ask, so local runs rely on the simulator instead.
+        """
+        if self.settings.send_mode == "console" or not igsid:
+            return None
+        url = f"https://graph.instagram.com/{self.settings.api_version}/{igsid}"
+        try:
+            async with httpx.AsyncClient(
+                timeout=min(self.settings.request_timeout, 5.0), transport=self.transport
+            ) as client:
+                response = await client.get(
+                    url,
+                    params={"fields": "username,name"},
+                    headers={"Authorization": f"Bearer {account.access_token}"},
+                )
+        except httpx.HTTPError as exc:
+            logger.warning("profile lookup failed for %s: %s", igsid, exc)
+            return None
+        if response.status_code != 200:
+            logger.warning("profile lookup for %s returned %s", igsid, response.status_code)
+            return None
+        try:
+            data = response.json()
+        except ValueError:
+            return None
+        username = str(data.get("username") or "").strip().lstrip("@")
+        if not username:
+            return None
+        return {"username": username, "name": str(data.get("name") or "").strip()}

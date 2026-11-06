@@ -96,3 +96,18 @@ def test_ops_endpoints(client, path):
     assert response.status_code == 200
     if path == "/health":
         assert response.json()["status"] == "ok"
+
+
+def test_username_from_payload_is_stored(client, settings):
+    from leadsbot import storage
+
+    body, headers = signed_payload(ACCOUNT_A, "u-social", "m-1", "Salam", username="@ig_user")
+    client.post("/webhook", content=body, headers=headers)
+    lead = storage.get_lead(settings.database_path, ACCOUNT_A, "u-social")
+    assert lead["username"] == "ig_user"
+
+    # A later message without the field must not wipe the stored username.
+    body, headers = signed_payload(ACCOUNT_A, "u-social", "m-2", "Elvin")
+    client.post("/webhook", content=body, headers=headers)
+    lead = storage.get_lead(settings.database_path, ACCOUNT_A, "u-social")
+    assert lead["username"] == "ig_user"

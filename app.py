@@ -22,6 +22,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from leadsbot import __version__, storage
 from leadsbot.admin import router as admin_router
 from leadsbot.config import ConfigError, load_settings
+from leadsbot.sender import InstagramSender
 from leadsbot.worker import OutboxWorker
 
 load_dotenv()
@@ -148,15 +149,20 @@ async def incoming(request: Request) -> dict[str, Any]:
             ):
                 skipped += 1
                 continue
+            sender_id = str(sender["id"])
+            incoming_username = sender.get("username")
+            if not isinstance(incoming_username, str) or not incoming_username.strip():
+                incoming_username = None
             try:
                 plan = storage.intake(
                     settings.database_path,
                     account_id,
-                    str(sender["id"]),
+                    sender_id,
                     str(message["mid"]),
                     text,
                     settings.max_hints,
                     notify_chat_ids=settings.telegram_chat_ids if settings.notifications_enabled else (),
+                    username=incoming_username,
                 )
             except Exception:
                 # Never acknowledge what we did not store: returning 200 here would
@@ -169,9 +175,25 @@ async def incoming(request: Request) -> dict[str, Any]:
                 skipped += 1  # duplicate delivery of an already handled message
             else:
                 accepted += 1
+                if not incoming_username and settings.send_mode == "api":
+                    await _fill_username(settings, account_id, sender_id)
     if failed:
         raise HTTPException(status_code=503, detail="Storage unavailable, retry the delivery")
     return {"status": "accepted", "accepted": accepted, "skipped": skipped}
+
+
+async def _fill_username(settings, account_id: str, sender_id: str) -> None:
+    """Cache the Instagram username once per conversation; never fatal."""
+    try:
+        lead = storage.get_lead(settings.database_path, account_id, sender_id)
+        account = settings.accounts.get(account_id)
+        if not lead or lead.get("username") or account is None:
+            return
+        profile = await InstagramSender(settings).fetch_profile(account, sender_id)
+        if profile:
+            storage.set_username(settings.database_path, account_id, sender_id, profile["username"])
+    except Exception:
+        logger.warning("username lookup failed for %s", sender_id, exc_info=True)
 
 
 @app.exception_handler(ConfigError)
