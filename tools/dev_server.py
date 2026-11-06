@@ -14,6 +14,8 @@ from __future__ import annotations
 import json
 import os
 import sys
+from pathlib import Path
+
 import uvicorn
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -35,7 +37,23 @@ DEFAULTS = {
 }
 
 
+def env_file_value(key: str) -> str | None:
+    """Value of KEY from .env, if present (used so the panel can be switched off)."""
+    path = Path(__file__).resolve().parent.parent / ".env"
+    if not path.exists():
+        return None
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line.startswith(f"{key}="):
+            return line.split("=", 1)[1].strip()
+    return None
+
+
 def main() -> None:
+    # An empty ADMIN_PASSWORD in .env keeps the panel disabled even in dev mode.
+    admin_password = env_file_value("ADMIN_PASSWORD")
+    if admin_password is not None:
+        DEFAULTS["ADMIN_PASSWORD"] = admin_password
     for key, value in DEFAULTS.items():
         os.environ.setdefault(key, value)
     host = os.environ.get("DEV_HOST", "127.0.0.1")
