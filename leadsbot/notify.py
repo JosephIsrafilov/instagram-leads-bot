@@ -42,27 +42,31 @@ class TelegramNotifier:
     async def notify(self, account_id: str, payload: str) -> None:
         if not self.settings.notifications_enabled:
             raise PermanentSendError("telegram notifications are not configured")
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError:
+            data = {}
+        # Each outbox row targets exactly one chat, so retries never duplicate
+        # delivery to the recipients that already succeeded.
+        chat_id = str(data.get("chat_id") or (self.settings.telegram_chat_ids or [""])[0])
+        if not chat_id:
+            raise PermanentSendError("no telegram chat id in payload")
         text = self.format_lead(account_id, payload)
         url = f"https://api.telegram.org/bot{self.settings.telegram_token}/sendMessage"
         async with httpx.AsyncClient(
             timeout=self.settings.request_timeout, transport=self.transport
         ) as client:
-            for chat_id in self.settings.telegram_chat_ids:
-                try:
-                    response = await client.post(
-                        url,
-                        json={
-                            "chat_id": chat_id,
-                            "text": text,
-                            "disable_web_page_preview": True,
-                        },
-                    )
-                except httpx.HTTPError as exc:
-                    raise SendError(f"telegram network error: {exc}") from exc
-                if 200 <= response.status_code < 300:
-                    continue
-                detail = f"telegram {response.status_code}: {response.text[:200]}"
-                if response.status_code == 429 or response.status_code >= 500:
-                    raise SendError(detail)
-                raise PermanentSendError(detail)
-        logger.info("lead notification sent for account %s", account_id)
+            try:
+                response = await client.post(
+                    url,
+                    json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True},
+                )
+            except httpx.HTTPError as exc:
+                raise SendError(f"telegram network error: {exc}") from exc
+        if 200 <= response.status_code < 300:
+            logger.info("lead notification sent to chat %s", chat_id)
+            return
+        detail = f"telegram {response.status_code}: {response.text[:200]}"
+        if response.status_code == 429 or response.status_code >= 500:
+            raise SendError(detail)
+        raise PermanentSendError(detail)

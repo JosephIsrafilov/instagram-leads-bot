@@ -22,7 +22,9 @@ def tg_settings(tmp_path, monkeypatch):
     return load_settings()
 
 
-PAYLOAD = json.dumps({"name": "Elvin", "phone": "+994501234567", "instagram_id": "900001"})
+PAYLOAD = json.dumps(
+    {"name": "Elvin", "phone": "+994501234567", "instagram_id": "900001", "chat_id": "111"}
+)
 
 
 def test_message_contains_lead_and_account(tg_settings):
@@ -33,7 +35,7 @@ def test_message_contains_lead_and_account(tg_settings):
     assert "900001" in text
 
 
-def test_sends_to_every_chat(tg_settings):
+def test_sends_only_to_the_chat_in_the_payload(tg_settings):
     seen: list[dict] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -41,10 +43,10 @@ def test_sends_to_every_chat(tg_settings):
         assert "bot-token" in str(request.url)
         return httpx.Response(200, json={"ok": True})
 
+    payload = json.dumps({"name": "Elvin", "phone": "+994501234567", "chat_id": "222"})
     notifier = TelegramNotifier(tg_settings, transport=httpx.MockTransport(handler))
-    asyncio.run(notifier.notify("123", PAYLOAD))
-    assert [item["chat_id"] for item in seen] == ["111", "222"]
-    assert "Elvin" in seen[0]["text"]
+    asyncio.run(notifier.notify("123", payload))
+    assert [item["chat_id"] for item in seen] == ["222"]
 
 
 @pytest.mark.parametrize("code", [429, 500, 503])
@@ -91,14 +93,14 @@ def test_lead_is_enqueued_and_delivered(settings, monkeypatch):
         "u1",
         "m1",
         "Elvin 0501234567",
-        notify_telegram=True,
+        notify_chat_ids=("111", "222"),
     )
     con = storage.connect(settings.database_path)
     try:
         channels = [row["channel"] for row in con.execute("SELECT channel FROM outbox ORDER BY id")]
     finally:
         con.close()
-    assert channels == ["instagram", "telegram"]
+    assert channels == ["instagram", "telegram", "telegram"]
 
     sent: list[str] = []
 
@@ -112,8 +114,8 @@ def test_lead_is_enqueued_and_delivered(settings, monkeypatch):
         sender_factory=lambda _s: _NoopSender(),
         telegram_factory=FakeNotifier,
     )
-    assert asyncio.run(worker.run_once(configured)) == 2
-    assert len(sent) == 1 and "Elvin" in sent[0]
+    assert asyncio.run(worker.run_once(configured)) == 3
+    assert len(sent) == 2 and all("Elvin" in item for item in sent)
     assert storage.stats(settings.database_path)["pending"] == 0
 
 

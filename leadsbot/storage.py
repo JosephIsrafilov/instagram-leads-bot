@@ -119,7 +119,7 @@ def intake(
     message_id: str,
     text: str,
     max_hints: int = 3,
-    notify_telegram: bool = False,
+    notify_chat_ids: tuple[str, ...] = (),
 ) -> Plan | None:
     """Record an incoming DM and enqueue the reply. None means "already handled"."""
     con = connect(db_path)
@@ -142,6 +142,7 @@ def intake(
             " WHERE account_id=? AND sender_id=?",
             (account_id, sender_id),
         ).fetchone()
+        previous_status = row["status"] if row is not None else None
         if row is None:
             plan = plan_reply(None, None, STATUS_AWAITING_CONTACT, 0, text, max_hints)
             con.execute(
@@ -159,18 +160,32 @@ def intake(
             )
         if plan.reply:
             enqueue(con, account_id, sender_id, plan.reply, stamp)
-        if notify_telegram and plan.status == STATUS_DONE and plan.phone:
-            enqueue(
-                con,
-                account_id,
-                sender_id,
-                json.dumps(
-                    {"name": plan.name, "phone": plan.phone, "instagram_id": sender_id},
-                    ensure_ascii=False,
-                ),
-                stamp,
-                channel="telegram",
-            )
+        if (
+            notify_chat_ids
+            and plan.status == STATUS_DONE
+            and previous_status != STATUS_DONE
+            and plan.phone
+        ):
+            # Only the transition into "done" notifies staff: later messages from the
+            # same customer must not spam the managers. One outbox row per recipient
+            # so a failure for one chat cannot duplicate delivery to another.
+            for chat_id in notify_chat_ids:
+                enqueue(
+                    con,
+                    account_id,
+                    sender_id,
+                    json.dumps(
+                        {
+                            "name": plan.name,
+                            "phone": plan.phone,
+                            "instagram_id": sender_id,
+                            "chat_id": chat_id,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    stamp,
+                    channel="telegram",
+                )
         con.commit()
         return plan
     except Exception:
@@ -208,12 +223,12 @@ def claim_due(db_path: str, limit: int = 20, lease_seconds: int = 120) -> list[d
             " WHERE o.sent_at IS NULL AND o.failed_at IS NULL"
             "   AND o.next_attempt_at <= ?"
             "   AND (o.locked_until IS NULL OR o.locked_until <= ?)"
-            # FIFO per conversation: never send message N+1 while N is still queued,
-            # otherwise a retried greeting can land after the next reply.
-            "   AND o.id = (SELECT MIN(x.id) FROM outbox x"
+            # FIFO per conversation for customer-visible replies: never send message N+1
+            # while N is still queued. Notifications are independent recipients.
+            "   AND (o.channel <> 'instagram' OR o.id = (SELECT MIN(x.id) FROM outbox x"
             "               WHERE x.account_id=o.account_id AND x.sender_id=o.sender_id"
             "                 AND x.channel=o.channel"
-            "                 AND x.sent_at IS NULL AND x.failed_at IS NULL)"
+            "                 AND x.sent_at IS NULL AND x.failed_at IS NULL))"
             " ORDER BY o.id LIMIT ?",
             (stamp, stamp, limit),
         ).fetchall()
@@ -262,6 +277,21 @@ def mark_failed(db_path: str, outbox_id: int, error: str, attempts: int = 0) -> 
             (now(), attempts, error[:500], outbox_id),
         )
         con.commit()
+    finally:
+        con.close()
+
+
+def cancel_pending(db_path: str, account_id: str, sender_id: str, reason: str) -> int:
+    """Drop queued replies for one dialogue - used when staff take over."""
+    con = connect(db_path)
+    try:
+        cursor = con.execute(
+            "UPDATE outbox SET failed_at=?, locked_until=NULL, last_error=?"
+            " WHERE account_id=? AND sender_id=? AND sent_at IS NULL AND failed_at IS NULL",
+            (now(), reason[:500], account_id, sender_id),
+        )
+        con.commit()
+        return int(cursor.rowcount)
     finally:
         con.close()
 
@@ -332,7 +362,9 @@ def stats(db_path: str) -> dict[str, Any]:
             "   WHERE status IN ('awaiting_contact','awaiting_name','awaiting_phone')) AS waiting,"
             " (SELECT COUNT(*) FROM conversations WHERE status='manual') AS manual,"
             " (SELECT COUNT(*) FROM outbox WHERE sent_at IS NULL AND failed_at IS NULL) AS pending,"
-            " (SELECT COUNT(*) FROM outbox WHERE failed_at IS NOT NULL) AS failed"
+            " (SELECT COUNT(*) FROM outbox WHERE failed_at IS NOT NULL"
+            "   AND COALESCE(last_error,'') NOT LIKE 'cancelled%') AS failed,"
+            " (SELECT COUNT(*) FROM outbox WHERE COALESCE(last_error,'') LIKE 'cancelled%') AS cancelled"
         ).fetchone()
         return dict(row)
     finally:
@@ -344,7 +376,8 @@ def failed_messages(db_path: str, limit: int = 20) -> list[dict[str, Any]]:
     try:
         rows = con.execute(
             "SELECT id, account_id, sender_id, body, attempts, last_error, failed_at"
-            " FROM outbox WHERE failed_at IS NOT NULL ORDER BY id DESC LIMIT ?",
+            " FROM outbox WHERE failed_at IS NOT NULL"
+            "   AND COALESCE(last_error,'') NOT LIKE 'cancelled%' ORDER BY id DESC LIMIT ?",
             (limit,),
         )
         return [dict(row) for row in rows]

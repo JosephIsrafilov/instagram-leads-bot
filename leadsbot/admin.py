@@ -71,6 +71,7 @@ PAGE = """<!doctype html>
  <div class="card"><span class="muted">Menecerdə</span><b>{manual}</b></div>
  <div class="card"><span class="muted">Gözləyən mesaj</span><b>{pending}</b></div>
  <div class="card"><span class="muted">Uğursuz</span><b>{failed}</b></div>
+ <div class="card"><span class="muted">Ləğv edilmiş</span><b>{cancelled}</b></div>
 </div>
 <p><a href="{csv_link}">CSV yüklə</a></p>
 <div class="filters">Hesab: {account_filters}</div>
@@ -219,6 +220,7 @@ def panel(
             manual=counters["manual"],
             pending=counters["pending"],
             failed=counters["failed"],
+            cancelled=counters["cancelled"],
             head="".join(f"<th>{label}</th>" for _, label in COLUMNS),
             rows="".join(rows),
             errors=errors,
@@ -250,6 +252,12 @@ def change_status(
         raise HTTPException(status_code=400, detail="Unknown status")
     if not storage.set_status(settings.database_path, account_id, sender_id, new_status):
         raise HTTPException(status_code=404, detail="Conversation not found")
+    if new_status == "manual":
+        # Staff own the dialogue now: drop anything still queued so the bot cannot
+        # answer over the manager's head.
+        storage.cancel_pending(
+            settings.database_path, account_id, sender_id, "cancelled: staff stopped the bot"
+        )
     target = back if back.startswith("/admin") else "/admin"
     return RedirectResponse(url=target, status_code=303)
 

@@ -86,8 +86,9 @@ CSV: `/admin/leads.csv?status=done&account=17841400000000001`.
 
 - counters: total conversations, captured leads, in progress, in manual, queued, failed
 - filters by account and status, 50 rows per page with pagination
-- **Botu dayandır** — the bot stops answering that customer (`manual`);
-  **Bota qaytar** — hand the dialogue back and reset the prompts
+- **Botu dayandır** — the bot stops answering that customer (`manual`) and any reply
+  still queued for them is cancelled; **Bota qaytar** — hand the dialogue back and
+  reset the prompts
 - failed outbox messages with the exact API error
 - CSV export (UTF-8 BOM, opens correctly in Excel), filterable by account/status
 - disabled entirely (503) when `ADMIN_PASSWORD` is empty, HTTP Basic otherwise
@@ -101,12 +102,15 @@ LEADS_TELEGRAM_CHAT_IDS=420193007,123456789
 
 When both are set, every captured lead is queued as a Telegram message (account, name,
 phone, Instagram ID) and delivered by the same worker, so a Telegram outage retries
-instead of losing the notification. Without the variables nothing is queued.
+instead of losing the notification. Only the transition into `done` notifies: a
+customer who keeps writing after the lead is captured never re-notifies managers.
+Each recipient gets its own queue row, so a failure for one chat cannot duplicate the
+message in another. Without the variables nothing is queued.
 
 ## Tests
 
 ```bash
-pytest -q          # 93 tests
+pytest -q          # 95 tests
 python tools/loadtest.py --count 500
 ```
 

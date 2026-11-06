@@ -156,7 +156,7 @@ async def incoming(request: Request) -> dict[str, Any]:
                     str(message["mid"]),
                     text,
                     settings.max_hints,
-                    notify_telegram=settings.notifications_enabled,
+                    notify_chat_ids=settings.telegram_chat_ids if settings.notifications_enabled else (),
                 )
             except Exception:
                 # Never acknowledge what we did not store: returning 200 here would

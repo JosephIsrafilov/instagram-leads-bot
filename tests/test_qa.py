@@ -284,3 +284,51 @@ def test_admin_filters_and_pagination(client, settings):
 def test_status_filter_rejects_unknown_values(client, settings):
     post(client, ACCOUNT_A, "qa", "m1", "Salam")
     assert client.get("/admin?status=whatever", auth=AUTH).status_code == 200
+
+
+# Staff notifications ---------------------------------------------------------
+def test_later_messages_do_not_renotify_staff(client, settings, monkeypatch):
+    monkeypatch.setenv("LEADS_TELEGRAM_TOKEN", "bot-token")
+    monkeypatch.setenv("LEADS_TELEGRAM_CHAT_IDS", "111")
+
+    post(client, ACCOUNT_A, "qa", "m1", "Salam")
+    post(client, ACCOUNT_A, "qa", "m2", "Elvin 0501234567")
+    for index in range(5):
+        post(client, ACCOUNT_A, "qa", f"m-extra-{index}", "Qiymət nədir?")
+
+    con = storage.connect(settings.database_path)
+    try:
+        telegram_rows = con.execute(
+            "SELECT COUNT(*) AS n FROM outbox WHERE channel='telegram'"
+        ).fetchone()["n"]
+    finally:
+        con.close()
+    assert telegram_rows == 1
+
+
+def test_stopping_the_bot_cancels_queued_replies(client, settings):
+    post(client, ACCOUNT_A, "qa", "m1", "Salam")  # greeting queued, not sent yet
+    assert storage.stats(settings.database_path)["pending"] == 1
+
+    response = client.post(
+        f"/admin/{ACCOUNT_A}/qa/status",
+        data={"new_status": "manual", "back": "/admin"},
+        auth=AUTH,
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert storage.stats(settings.database_path)["pending"] == 0
+
+    drain(settings)  # nothing left to send
+    con = storage.connect(settings.database_path)
+    try:
+        assert con.execute("SELECT COUNT(*) AS n FROM outbox WHERE sent_at IS NOT NULL").fetchone()["n"] == 0
+        last_error = con.execute("SELECT last_error FROM outbox").fetchone()["last_error"]
+    finally:
+        con.close()
+    assert "cancelled" in last_error
+    counters = storage.stats(settings.database_path)
+    assert counters["cancelled"] == 1 and counters["failed"] == 0
+    assert storage.failed_messages(settings.database_path) == []
+    panel = client.get("/admin", auth=AUTH).text
+    assert "Ləğv edilmiş" in panel
